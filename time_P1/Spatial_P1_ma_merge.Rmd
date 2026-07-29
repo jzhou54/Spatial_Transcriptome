@@ -1,0 +1,376 @@
+---
+title: "Han_spatial_P1_ManualAlignment"
+author: "Department of Biostat and Bioinfo"
+date: "2024-10-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 12, fig.height = 8 , message = F)
+options(future.globals.maxSize = 2500 * 1024^2) # Increase limit to 2500 MiB
+
+library(Seurat) 
+library(future)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(dittoSeq)
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(stringr)
+library(readxl)
+library(tidyverse)
+
+# cutoff.nCount <- 1000
+cutoff.nFeature <- 1000
+```
+
+
+## Data Loading
+
+```{r}
+Sample_A <- Load10X_Spatial("sample_A_manual/outs/", slice = "P1_SampleA")
+Sample_B <- Load10X_Spatial("sample_B_manual/outs/", slice = "P1_SampleB")
+Sample_A$orig.ident <- "P1_SampleA"
+Sample_B$orig.ident <- "P1_SampleB"
+Sample_B <- RenameCells(Sample_B, new.names = gsub("-1","-2", colnames(Sample_B)))
+
+Sample_A
+Sample_B
+```
+
+## Merge and filtering
+
+Filter the cells with at least 1000 gene features. 
+
+```{r}
+merge.P1 <- merge(Sample_A,  y =  Sample_B, project = "Han", merge.data = FALSE)
+merge.P1$orig.ident <- factor(merge.P1$orig.ident, levels = c("P1_SampleA","P1_SampleB"))
+Idents(merge.P1) <- "orig.ident"
+
+## filtering nCount_Spatial > 1000 & nFeature_Spatial > 1000
+merge.P1.filtered <- subset(merge.P1, subset =  nFeature_Spatial >= cutoff.nFeature) 
+merge.P1.filtered <- SetIdent(merge.P1.filtered, value = "orig.ident")
+
+VlnPlot(merge.P1.filtered, features = "nFeature_Spatial", split.by = "orig.ident")
+VlnPlot(merge.P1.filtered, features = "nCount_Spatial", split.by = "orig.ident")
+
+SpatialFeaturePlot(merge.P1.filtered, features = "nFeature_Spatial", ncol = 2, pt.size.factor = 0.8, image.scale = "hires") 
+SpatialFeaturePlot(merge.P1.filtered, features = "nCount_Spatial", ncol = 2, pt.size.factor = 0.8, image.scale = "hires") 
+
+## deleted spots
+# merge.P1.deleted <- subset(merge.P1, subset = nFeature_Spatial <= cutoff.nFeature)
+# SpatialFeaturePlot(merge.P1.deleted, features = "nCount_Spatial", ncol = 2, pt.size.factor = 1.6)
+# SpatialFeaturePlot(merge.P1.deleted, features = "nFeature_Spatial", ncol = 2, pt.size.factor = 1.6)
+
+rm(Sample_A, Sample_B, merge.P1)
+```
+
+
+## Prepare for integration
+
+```{r qc, fig.width=12, fig.height=10}
+P1.list <- SplitObject(merge.P1.filtered, split.by = "orig.ident")
+P1.list <- lapply(X = P1.list, FUN = SCTransform, assay = "Spatial", method = "glmGamPoi", verbose=F)
+features <- SelectIntegrationFeatures(object.list = P1.list, nfeatures = 3000)
+P1.list <- PrepSCTIntegration(object.list = P1.list, anchor.features = features)
+
+# P1.list[["P1_SampleA"]]@images[["P1_SampleB"]] <- NULL;
+# P1.list[["P1_SampleB"]]@images[["P1_SampleA"]] <- NULL
+
+## find anchors
+P1.anchor <- FindIntegrationAnchors(object.list = P1.list,
+                                    normalization.method = "SCT",
+                                    anchor.features = features)
+
+P1.combind.sct <- IntegrateData(anchorset = P1.anchor, normalization.method = "SCT", verbose = F)
+rm(P1.anchor, P1.list)
+```
+
+
+## Finding neighbors and clustering
+
+```{r, fig.width=12, fig.height=6}
+resolution <- 1.8 # higher resolution, more clusters
+
+P1.combind.sct  <- RunPCA(P1.combind.sct, verbose = F) %>%
+  RunUMAP(reduction = "pca", dims = 1:30) %>%
+  FindNeighbors(dims=1:30, verbose = F) %>%
+  FindClusters(verbose = F, resolution = resolution) # resolution=1.8
+
+p.ident <- dittoDimPlot(P1.combind.sct, var = "orig.ident", reduction.use = "umap", 
+             do.label = TRUE, labels.highlight = FALSE)
+p.clust <- dittoDimPlot(P1.combind.sct, var = "seurat_clusters", reduction.use = "umap", 
+             do.label = TRUE, labels.highlight = FALSE)
+
+p.ident | p.clust
+```
+
+
+## Clusters for merged data
+
+```{r echo=FALSE, message=FALSE, fig.width=12, fig.height=6}
+merge.P1.filtered <- SCTransform(merge.P1.filtered, method = "glmGamPoi", assay = "Spatial",
+                        verbose = F, return.only.var.genes = FALSE)
+
+merge.P1.filtered  <- RunPCA(merge.P1.filtered, verbose = F) %>%
+  RunUMAP(reduction = "pca", dims = 1:30) %>%
+  FindNeighbors(dims=1:30, verbose = F) %>%
+  FindClusters(verbose = F)
+
+SpatialDimPlot(merge.P1.filtered)
+dittoDimPlot(merge.P1.filtered, var = "orig.ident", reduction.use = "umap", 
+             do.label = TRUE, labels.highlight = FALSE)
+
+p.ident2 <- dittoDimPlot(merge.P1.filtered, var = "orig.ident", reduction.use = "umap",
+             do.label = TRUE, labels.highlight = FALSE)
+
+p.clust2 <- dittoDimPlot(merge.P1.filtered, var = "seurat_clusters", reduction.use = "umap",
+             do.label = TRUE, labels.highlight = FALSE)
+
+p.ident2 | p.clust2
+# p.ident2 | p.ident
+
+dittoDimPlot(merge.P1.filtered, var = "seurat_clusters", reduction.use = "umap",
+             do.label = TRUE, labels.highlight = FALSE,
+             split.by = "orig.ident", split.ncol = 2)
+# ggsave(filename = "Ditto_Umap_clusters_splitbySample.pdf")
+```
+
+Check whether the order of the barcodes are the same. Replace cell embeddings and seurat clusters from integrated data. 
+
+```{r}
+all.equal(colnames(merge.P1.filtered), colnames(P1.combind.sct)) # TRUE 
+temp <- match(colnames(merge.P1.filtered), colnames(P1.combind.sct))
+all.equal(colnames(merge.P1.filtered), colnames(P1.combind.sct)[temp])
+
+# replace cell embeddings and seurat clusters from integrated data (feature=3000).
+merge.P1.filtered@reductions$pca@cell.embeddings <- P1.combind.sct@reductions$pca@cell.embeddings[temp,]
+merge.P1.filtered@reductions$umap@cell.embeddings <- P1.combind.sct@reductions$umap@cell.embeddings[temp,]
+
+seurat_clusters_merge <- merge.P1.filtered$seurat_clusters
+seurat_clusters_integrate <- P1.combind.sct[temp,]$seurat_clusters
+seurat_clusters <- data.frame("seurat_clusters_merge" = seurat_clusters_merge, "seurat_clusters_integrate"=seurat_clusters_integrate)
+merge.P1.filtered$seurat_clusters <- P1.combind.sct$seurat_clusters[temp] # check whether is assigned correctly
+merge.P1.filtered$SCT_label <- merge.P1.filtered$seurat_clusters  ## 25 clusters
+rm(P1.combind.sct, seurat_clusters)
+```
+
+## UMAP visualization
+
+```{r, fig.width=12, fig.height=6}
+p.sample <- dittoDimPlot(merge.P1.filtered, var = "orig.ident", reduction.use = "umap", 
+             do.label = FALSE, labels.highlight = FALSE)
+
+p.cluster <- dittoDimPlot(merge.P1.filtered, var = "seurat_clusters", reduction.use = "umap", 
+             do.label = TRUE, labels.highlight = TRUE,
+             color.panel = dittoColors()[-4])
+
+p.sample.split <- dittoDimPlot(merge.P1.filtered, var = "orig.ident", reduction.use = "umap", 
+             do.label = FALSE, labels.highlight = FALSE,
+             split.by = "orig.ident", split.ncol = 2)
+
+p.cluster.hightlight <- dittoDimPlot(merge.P1.filtered, var = "seurat_clusters", reduction.use = "umap", 
+             do.label = TRUE, labels.highlight = FALSE,
+             split.by = "seurat_clusters", split.ncol = 4,
+             color.panel = dittoColors()[-4])
+
+p.sample | p.cluster
+p.sample.split
+```
+
+
+
+## Spatial Plot
+
+
+### Cluster changes from 10--0--1--4--22
+
+```{r echo=FALSE, fig.height=8, fig.width=12}
+pt.size = 2.3
+merge.P1.filtered <- SetIdent(merge.P1.filtered, value = "seurat_clusters")
+
+p1 <- SpatialDimPlot(merge.P1.filtered, pt.size.factor = pt.size, cols.highlight = c("#DE2D26", "black")) 
+
+p2 <- SpatialDimPlot(merge.P1.filtered, pt.size.factor = pt.size,
+                     cells.highlight = CellsByIdentities(object = merge.P1.filtered, idents = c (10)),
+               facet.highlight = F, cols.highlight = c("#DE2D26", "black")) 
+p3 <- SpatialDimPlot(merge.P1.filtered, pt.size.factor = pt.size, 
+                     cells.highlight = CellsByIdentities(object = merge.P1.filtered, idents = c (0)),
+               facet.highlight = F, cols.highlight = c("#DE2D26", "black")) 
+p4 <- SpatialDimPlot(merge.P1.filtered, pt.size.factor = pt.size,
+                     cells.highlight = CellsByIdentities(object = merge.P1.filtered, idents = c (1)),
+               facet.highlight = F, cols.highlight = c("#DE2D26", "black")) 
+
+p5 <- SpatialDimPlot(merge.P1.filtered, pt.size.factor = pt.size,
+                     cells.highlight = CellsByIdentities(object = merge.P1.filtered, idents = c (4)),
+               facet.highlight = F, cols.highlight = c("#DE2D26", "black")) 
+
+p6 <- SpatialDimPlot(merge.P1.filtered, pt.size.factor = pt.size,
+                     cells.highlight = CellsByIdentities(object = merge.P1.filtered, idents = c (22)),
+               facet.highlight = F, cols.highlight = c("#DE2D26", "black")) 
+
+p1
+p2 
+p3 
+p4 
+p5 
+p6
+## resolution = 1.8, cluster layer moves from 10--0--1--4--22
+
+```
+
+## Sample distribution in each cluster
+
+```{r, fig.width=12, fig.height=10}
+meta.data <- merge.P1.filtered@meta.data
+image_coord_A <- merge.P1.filtered@images[["P1_SampleA"]]@coordinates
+image_coord_B <- merge.P1.filtered@images[["P1_SampleB"]]@coordinates
+
+image_coord_A$sample_cond <- ifelse(image_coord_A$imagecol < 9100, "InjuryA", "ControlA")
+image_coord_B$sample_cond <- ifelse(image_coord_B$imagecol < -0.33*image_coord_B$imagerow + 10600, 
+                                    "InjuryB", "ControlB")
+image_df = rbind(image_coord_A, image_coord_B)
+
+ind <- match(rownames(image_df), rownames(meta.data))
+metadata <- cbind(meta.data[ind,], image_df )
+metadata$cond <- str_extract(metadata$sample_cond, "Control|Injury")
+
+merge.P1.filtered@meta.data <- metadata
+SpatialDimPlot(merge.P1.filtered, group.by = "cond")
+
+p.c.dist <- ggplot(metadata, aes(fill = sample_cond, x=seurat_clusters)) + geom_bar(position = "fill") + scale_fill_brewer()
+p1 / p.c.dist
+```
+
+
+## Markers
+
+
+### All markers
+
+
+```{r allmarkers, echo=FALSE}
+# allmarkers <- FindAllMarkers(merge.P1.filtered, assay = "SCT")
+# saveRDS(allmarkers, file = "allmarkers_P1_ManualAlign.rds")
+# write.csv(allmarkers, file = "allmarkers_P1_ManualAlign.csv")
+
+allmarkers <- readRDS(file = "allmarkers_P1_ManualAlign.rds")
+DT::datatable(allmarkers)
+```
+
+
+### Heatmap 
+
+Top 20 over-expressed genes in each cluster with log2FC higher than 0.5
+
+```{r heatmap, echo=FALSE}
+top20 <- allmarkers  %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 0.5) %>%
+    top_n(20, avg_log2FC) %>%
+    ungroup() 
+
+DoHeatmap(merge.P1.filtered, features = top20$gene) + NoLegend()
+```
+
+
+
+```{r}
+saveRDS(merge.P1.filtered, "seurat_obj_P1_ManualAlign_mergedata_SCT.rds")
+```
+
+
+## Markers between layers
+
+```{r}
+merge.P1.filtered <- readRDS("seurat_obj_P1_ManualAlign_mergedata_SCT.rds")
+markers.conn1 <- FindMarkers(merge.P1.filtered, ident.1 = 10, ident.2 = 0)
+markers.conn2 <- FindMarkers(merge.P1.filtered, ident.1 = 0, ident.2 = 1)
+markers.conn3 <- FindMarkers(merge.P1.filtered, ident.1 = 1, ident.2 = 4)
+markers.conn4 <- FindMarkers(merge.P1.filtered, ident.1 = 4, ident.2 = 22)
+
+write.csv(markers.conn1, "markers_P1_WithinLayer_conn1.csv")
+write.csv(markers.conn2, "markers_P1_WithinLayer_conn2.csv")
+write.csv(markers.conn3, "markers_P1_WithinLayer_conn3.csv")
+write.csv(markers.conn4, "markers_P1_WithinLayer_conn4.csv")
+```
+
+
+
+
+```{r, fig.width=12, fig.height=6}
+## GO term
+genes <- markers.conn1 %>% filter(avg_log2FC > 0.585, p_val_adj < 0.01) %>% rownames()
+GO.res <- enrichGO(genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP",
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+p1 <- treeplot(GO.res, showCategory = 30)
+p1
+ggsave(filename = "Treeplot_GOterms_markers_P1_WithinLayer_conn1.png")
+write.csv(GO.res@result, file = "GOterms_markers_P1_WithinLayer_conn1.csv")
+
+##
+rm(genes, GO.res, p1)
+genes <- markers.conn2 %>% filter(avg_log2FC > 0.585, p_val_adj < 0.01) %>% rownames()
+GO.res <- enrichGO(genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP",
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+p1 <- treeplot(GO.res, showCategory = 30)
+p1
+ggsave(filename = "Treeplot_GOterms_markers_P1_WithinLayer_conn2.png")
+write.csv(GO.res@result, file = "GOterms_markers_P1_WithinLayer_conn2.csv")
+
+##
+rm(genes, GO.res, p1)
+genes <- markers.conn3 %>% filter(avg_log2FC > 0.585, p_val_adj < 0.01) %>% rownames()
+GO.res <- enrichGO(genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP",
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+p1 <- treeplot(GO.res, showCategory = 30)
+p1
+ggsave(filename = "Treeplot_GOterms_markers_P1_WithinLayer_conn3.png")
+write.csv(GO.res@result, file = "GOterms_markers_P1_WithinLayer_conn3.csv")
+
+##
+rm(genes, GO.res, p1)
+genes <- markers.conn4 %>% filter(avg_log2FC > 0.585, p_val_adj < 0.01) %>% rownames()
+GO.res <- enrichGO(genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP",
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+p1 <- treeplot(GO.res, showCategory = 30)
+p1
+ggsave(filename = "Treeplot_GOterms_markers_P1_WithinLayer_conn4.png")
+write.csv(GO.res@result, file = "GOterms_markers_P1_WithinLayer_conn4.csv")
+```
+
+```{r}
+merge.P1.filtered <- readRDS("seurat_obj_P1_ManualAlign_mergedata_SCT.rds")
+table(merge.P1.filtered$tissue)
+SHAM <- subset(merge.P1.filtered, subset = cond == "Control")
+SHAM <- SetIdent(SHAM, value = "tissue")
+Feature_avgExp_sham <- AverageExpression(SHAM, assays = "SCT", return.seurat = F)$SCT
+Feature_avgExp_sham <- as.data.frame(Feature_avgExp_sham)
+Feature_avgExp_sham_order <- Feature_avgExp_sham %>% arrange(desc(all)) %>% head(n=3000) %>% rownames() 
+
+
+LAD <- subset(merge.P1.filtered, subset = cond == "Injury")
+LAD <- SetIdent(LAD, value = "tissue")
+Feature_avgExp_LAD <- AverageExpression(LAD, assays = "SCT", return.seurat = F)$SCT
+Feature_avgExp_LAD <- as.data.frame(Feature_avgExp_LAD)
+Feature_avgExp_LAD_order <- Feature_avgExp_LAD %>% arrange(desc(all)) %>% head(n=3000) %>% rownames() 
+
+highly_express_genes <- c(Feature_avgExp_sham_order, Feature_avgExp_LAD_order) %>% unique()
+write.csv(highly_express_genes, file = "Merged_Top3000_highlyexpGenes_P1.csv")
+
+```
+
+
