@@ -1,0 +1,2318 @@
+---
+title: "scRNA integration across timepoints, samples and condtions"
+author: "Department of Biostat and Bioinfo"
+date: "2025-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 12, fig.height = 6 , message = F, warning = F)
+options(future.globals.maxSize = 5000 * 1024^2) # Increase limit to 
+# options(scipen = 999)
+library(Seurat) 
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(SummarizedExperiment)
+library(tidyverse)
+library(ggfortify)
+library(scales)
+library(data.table)
+library(SPOTlight)
+library(viridis)
+library(DT)
+library(RColorBrewer)
+library(MAESTRO)
+library(clusterProfiler)
+library(enrichplot)
+
+c25 <- c(
+  "dodgerblue2", "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+topn = 3000
+bkg_genes <- read.csv(file = paste0("../GOterms/Top",topn,"_highlyexpGenes_all.csv") )
+bkg_genes <- bkg_genes$x
+
+msig.mhallmark <- read.gmt("~/Downloads/myDB/annotation/MSigDB_mouse_2024/mh.all.v2024.1.Mm.symbols.gmt")
+msig.m2 <- read.gmt("~/Downloads/myDB/annotation/MSigDB_mouse_2024/m2.cp.v2024.1.Mm.symbols.gmt")
+```
+
+ 
+## Data input and split 
+
+Input rds object from timepoint P1 and P7, split the object based on sample_condition to get 8 replicates.
+
+
+```{r fig.height=6, fig.width=12}
+## subset time_sample_cond, get 8 rep
+
+merge.P1.filtered <- readRDS("~/Downloads/Projects/Han_spatial_2024/P1/seurat_obj_P1_ManualAlign_mergedata_SCT.rds")
+# merge.P1.filtered@assays$SCT <-  NULL
+P1_sampleA_Inj <- subset(merge.P1.filtered, subset = sample_cond=="InjuryA" )
+P1_sampleA_Ctr <- subset(merge.P1.filtered, subset = sample_cond=="ControlA" )
+P1_sampleB_Inj <- subset(merge.P1.filtered, subset = sample_cond=="InjuryB" )
+P1_sampleB_Ctr <- subset(merge.P1.filtered, subset = sample_cond=="ControlB" ); rm(merge.P1.filtered)
+
+merge.P7.filtered <- readRDS("~/Downloads/Projects/Han_spatial_2024/P7/seurat_obj_P7_ManualAlign_mergedata_SCT.rds")
+# merge.P7.filtered@assays$SCT <-  NULL
+P7_sampleA_Inj <- subset(merge.P7.filtered, subset = sample_cond=="InjuryA" )
+P7_sampleA_Ctr <- subset(merge.P7.filtered, subset = sample_cond=="ControlA" )
+P7_sampleB_Inj <- subset(merge.P7.filtered, subset = sample_cond=="InjuryB" )
+P7_sampleB_Ctr <- subset(merge.P7.filtered, subset = sample_cond=="ControlB" ); rm(merge.P7.filtered)
+
+
+## Simple merging
+
+merge.postnatal <- merge(P1_sampleA_Inj, y = c(P1_sampleA_Ctr, P1_sampleB_Inj, P1_sampleB_Ctr,
+                                         P7_sampleA_Inj, P7_sampleA_Ctr, P7_sampleB_Inj, P7_sampleB_Ctr) 
+                   )
+
+rm(P1_sampleA_Inj, P1_sampleA_Ctr, P1_sampleB_Inj, P1_sampleB_Ctr,
+    P7_sampleA_Inj, P7_sampleA_Ctr, P7_sampleB_Inj, P7_sampleB_Ctr)
+
+merge.postnatal$timesamplecond <- paste0(merge.postnatal$orig.ident,"_", merge.postnatal$cond)
+merge.postnatal$time <- substr(merge.postnatal$orig.ident, 1, 2)
+```
+
+
+## Integration
+
+Split the Spatial assay according to its meta timesamolecond, and normalize it using SCTransform.
+In integration step, use CCA method in function IntegrateLayers. Use resolution 1.2 to cluster the spots.
+
+
+```{r integrate, fig.height=6, fig.width=12, warning=FALSE}
+
+## prestep
+merge.postnatal[["Spatial"]] <- split(merge.postnatal[["Spatial"]], f = merge.postnatal$timesamplecond)
+merge.postnatal <- SCTransform(merge.postnatal, assay = "Spatial")
+merge.postnatal <- RunPCA(merge.postnatal)
+merge.postnatal <- FindNeighbors(merge.postnatal, dims = 1:30, reduction = "pca")
+merge.postnatal <- FindClusters(merge.postnatal, cluster.name = "unintegrated_clusters")
+# merge.postnatal <- RunUMAP(merge.postnatal, dims = 1:30)
+
+p1 <- DimPlot(merge.postnatal, group.by = "time") 
+p2 <- DimPlot(merge.postnatal, group.by = "sample_cond") 
+p3 <- DimPlot(merge.postnatal, group.by = "timesamplecond")
+
+p1 | p2 | p3
+
+
+
+####==== CCA integration ====####
+merge.postnatal <- IntegrateLayers(object = merge.postnatal, method = CCAIntegration,
+                              verbose = F, normalization.method = "SCT")
+merge.postnatal[["Spatial"]] <- JoinLayers(merge.postnatal[["Spatial"]])
+
+####==== Harmony ====####
+# merge.postnatal <- IntegrateLayers(object = merge.postnatal, method = HarmonyIntegration, 
+#                               verbose = F, normalization.method = "SCT") 
+
+
+merge.postnatal <- FindNeighbors(merge.postnatal, reduction = "integrated.dr", dims = 1:30)
+merge.postnatal <- FindClusters(merge.postnatal, resolution = 1.2)
+merge.postnatal <- RunUMAP(merge.postnatal, dims = 1:30, reduction = "integrated.dr")
+
+
+DimPlot(merge.postnatal, reduction = "umap", group.by = c("seurat_clusters", "orig.ident"), cols = c25, pt.size = 0.6)
+DimPlot(merge.postnatal, reduction = "umap", group.by = c("orig.ident", "sample_cond", "cond"), cols = c25, pt.size = 0.6)
+DimPlot(merge.postnatal, reduction = "umap", group.by = c("sample_cond",  "timesamplecond"), 
+        cols = brewer.pal(10,"Paired"), pt.size = 0.6)
+
+```
+
+
+```{r fig.width=12, fig.height=8}
+table(merge.postnatal$seurat_clusters, merge.postnatal$timesamplecond)
+table(merge.postnatal$seurat_clusters, merge.postnatal$sample_cond)
+
+ptsize <- 4
+immune.marker <- c("Apoe", "Nppa", "C1qa", "Spp1")
+
+FeaturePlot(merge.postnatal, features = immune.marker, split.by = "orig.ident")
+SpatialFeaturePlot(merge.postnatal, features = immune.marker, pt.size.factor = ptsize )
+
+SpatialDimPlot(merge.postnatal, pt.size.factor = ptsize, ncol = 2) 
+SpatialDimPlot(merge.postnatal, pt.size.factor = ptsize, ncol = 4,   cols = c("4" = "#DE2D26", "6" = "green", 
+                                                                              "8" = "yellow",  "9" = "blue")) 
+```
+
+## DEG
+
+```{r}
+for (i in 1:length(merge.postnatal[["SCT"]]@SCTModel.list)){
+  slot(merge.postnatal@assays$SCT@SCTModel.list[[i]], name = "umi.assay") <- "Spatial"
+}
+
+merge.postnatal <- PrepSCTFindMarkers(merge.postnatal, assay = "SCT", verbose = F)
+all_markers <- FindAllMarkers(merge.postnatal, verbose = F)
+```
+
+
+## Find DEGs between Injury and Control for some clusters 
+
+
+```{r}
+logfc_cutoff <- 1
+padj_cutoff <- 0.01
+
+merge.postnatal.P1 <- subset(merge.postnatal, subset=time =="P1")
+merge.postnatal.P7 <- subset(merge.postnatal, subset=time =="P7")
+
+```
+
+
+
+### Cluster 4: P1
+
+```{r warning=FALSE}
+
+DEG_comp_cond <- FindMarkers(merge.postnatal.P1, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "4", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### Cluster 4: P7
+
+```{r warning=FALSE}
+
+DEG_comp_cond <- FindMarkers(merge.postnatal.P7, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "4", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### Cluster 6: P1
+
+```{r warning=FALSE}
+rm(DEG_comp_cond, genes, GO.res, p1, p2, ER.h, ER.cp)
+DEG_comp_cond <- FindMarkers(merge.postnatal.P1, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "6", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### Cluster 6: P7
+
+```{r warning=FALSE}
+rm(DEG_comp_cond, genes, GO.res, p1, p2, ER.h, ER.cp)
+DEG_comp_cond <- FindMarkers(merge.postnatal.P7, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "6", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### Cluster 8: P1
+
+```{r warning=FALSE}
+rm(DEG_comp_cond, genes, GO.res, p1, p2, ER.h, ER.cp)
+DEG_comp_cond <- FindMarkers(merge.postnatal.P1, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "8", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+
+### Cluster 8: P7
+
+```{r warning=FALSE}
+rm(DEG_comp_cond, genes, GO.res, p1, p2, ER.h, ER.cp)
+DEG_comp_cond <- FindMarkers(merge.postnatal.P7, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "8", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### Cluster 9: P1
+
+```{r warning=FALSE}
+rm(DEG_comp_cond, genes, GO.res, p1, p2, ER.h, ER.cp)
+DEG_comp_cond <- FindMarkers(merge.postnatal.P1, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "9", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+
+
+
+
+
+### Cluster 9: P7
+
+```{r warning=FALSE}
+rm(DEG_comp_cond, genes, GO.res, p1, p2, ER.h, ER.cp)
+DEG_comp_cond <- FindMarkers(merge.postnatal.P7, group.by = "cond", ident.1 = "Injury", ident.2 = "Control", 
+                             subset.ident = "9", recorrect_umi = FALSE)
+datatable(DEG_comp_cond)
+
+
+genes <- DEG_comp_cond %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+
+## Find DEGs between P1 and P7 for sample condition
+
+```{r}
+merge.postnatal.Inj <- subset(merge.postnatal, subset=cond =="Injury")
+merge.postnatal.Ctr <- subset(merge.postnatal, subset=cond =="Control")
+```
+
+
+### Cluster 4: Injury
+
+```{r warning=FALSE}
+rm(genes, GO.res, p1, p2, ER.h, ER.cp)
+
+DEG_comptime <- FindMarkers(merge.postnatal.Inj, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "4", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+# overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+
+datatable(GO.res@result)
+```
+
+
+
+### Cluster 4: Control
+
+```{r warning=FALSE}
+rm(DEG_comptime, genes, GO.res, p1, p2, ER.h, ER.cp)
+
+DEG_comptime <- FindMarkers(merge.postnatal.Ctr, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "4", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+# overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+n.GOterm <- sum(GO.res@result$p.adjust <=0.05)
+if (n.GOterm > 0) GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+
+  p1
+  p2
+  datatable(GO.res@result)
+}
+
+
+```
+
+
+### Cluster 6: Injury
+
+```{r warning=FALSE}
+rm(DEG_comptime, genes, GO.res, p1, p2, ER.h, ER.cp)
+
+DEG_comptime <- FindMarkers(merge.postnatal.Inj, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "6", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+# overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+n.GOterm <- sum(GO.res@result$p.adjust <=0.05)
+if (n.GOterm > 0) GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+
+  p1
+  p2
+  datatable(GO.res@result)
+}
+
+```
+
+
+
+### Cluster 8: Injury
+
+```{r warning=FALSE}
+rm(DEG_comptime, genes, GO.res, p1, p2, ER.h, ER.cp)
+
+DEG_comptime <- FindMarkers(merge.postnatal.Inj, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "8", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+# overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+n.GOterm <- sum(GO.res@result$p.adjust <=0.05)
+if (n.GOterm > 0) GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+ 
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+  
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result)
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+
+### Cluster 8: Control
+
+```{r warning=FALSE}
+rm(DEG_comptime, genes, GO.res, p1, p2, ER.h, ER.cp)
+
+DEG_comptime <- FindMarkers(merge.postnatal.Ctr, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "8", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+overlap_genes
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+n.GOterm <- sum(GO.res@result$p.adjust <=0.05)
+if (n.GOterm > 0) GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result)
+
+
+```
+
+
+### Cluster 9: Injury
+
+```{r warning=FALSE}
+rm(DEG_comptime, genes, GO.res, p1, p2, ER.h, ER.cp)
+
+
+DEG_comptime <- FindMarkers(merge.postnatal.Inj, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "9", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.GOterm <- sum(GO.res@result$p.adjust <=0.05)
+if (n.GOterm > 0) GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+ 
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+  
+}
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+
+datatable(GO.res@result)
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### Cluster 9: Control
+
+```{r warning=FALSE}
+rm(DEG_comptime, genes, GO.res, p1, p2, ER.h, ER.cp)
+
+DEG_comptime <- FindMarkers(merge.postnatal.Ctr, group.by = "time", ident.1 = "P1", ident.2 = "P7", 
+                             subset.ident = "4", recorrect_umi = FALSE)
+
+genes <- DEG_comptime %>% filter(avg_log2FC > logfc_cutoff, p_val_adj < padj_cutoff) %>% rownames()
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+n.GOterm <- sum(GO.res@result$p.adjust <=0.05)
+if (n.GOterm > 0) GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+ 
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+  
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  p2
+
+  datatable(GO.res@result)
+
+  
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+## Cell type annotation
+
+```{r, fig.width=12, fig.height=6}
+data("mouse.all.droplet.TabulaMuris")
+sig.mouse.heart <- mouse.all.droplet.TabulaMuris[grep("\\(Heart_and_Aorta\\)", mouse.all.droplet.TabulaMuris$cluster) ,]
+sig.mouse.heart$cluster <- gsub("\\(Heart_and_Aorta\\)", "", sig.mouse.heart$cluster)
+rownames(all_markers) <- NULL
+colnames(all_markers) <- c("p_val","avg_logFC","pct.1","pct.2","p_val_adj","cluster","gene")
+
+merge.postnatal <- RNAAnnotateCelltype(RNA= merge.postnatal, genes = all_markers, 
+                                    signatures = sig.mouse.heart)
+
+table(merge.postnatal$timesamplecond, merge.postnatal$assign.ident)
+DimPlot(merge.postnatal, group.by = "assign.ident", label = T)
+dittoSeq::dittoDimPlot(merge.postnatal, var ="assign.ident" , split.by   = "timesamplecond")
+```
+
+
+
+
+
+```{r eval=FALSE, include=FALSE}
+cls = 0
+cls_topmarkers <- all_markers %>% filter(avg_logFC > 0 , cluster == cls) %>% pull(gene) %>% head(n=25)
+overlaps_tbl <- clustermole::clustermole_overlaps(genes = cls_topmarkers, species = "mm")
+overlaps_tbl %>% filter(species == "Mouse", fdr <=0.05)
+
+
+cls = 1
+cls_topmarkers <- all_markers %>% filter(avg_logFC > 0 , cluster == cls) %>% pull(gene) %>% head(n=25)
+overlaps_tbl <- clustermole::clustermole_overlaps(genes = cls_topmarkers, species = "mm")
+overlaps_tbl %>% filter(species == "Mouse", fdr <=0.05)
+
+cls = 6
+cls_topmarkers <- all_markers %>% filter(avg_logFC > 0 , cluster == cls) %>% pull(gene) %>% head(n=25)
+overlaps_tbl <- clustermole::clustermole_overlaps(genes = cls_topmarkers, species = "mm")
+overlaps_tbl %>% filter(species == "Mouse", fdr <=0.05)
+
+cls = 8
+cls_topmarkers <- all_markers %>% filter(avg_logFC > 0 , cluster == cls) %>% pull(gene) %>% head(n=25)
+overlaps_tbl <- clustermole::clustermole_overlaps(genes = cls_topmarkers, species = "mm")
+overlaps_tbl %>% filter(species == "Mouse")
+```
+
+
+## GO terms and MsigDB pathway
+
+### DEGs in cluster 0
+
+```{r, fig.width=15, fig.height=8}
+all_pos_markers <- all_markers %>% filter(avg_logFC > 0)
+
+cls <- 0
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", 
+                   universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+GO.res <- pairwise_termsim(GO.res, method = "JC")
+
+if (dim(GO.res@termsim)[1] >=5 ){
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  
+  p1 <- treeplot(GO.res, showCategory = 30)
+  p1
+
+}
+
+p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+p2
+datatable(GO.res@result, extensions="Buttons",
+            options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 1
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 1
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+  }
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 2
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 2
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 3
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 3
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 4
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 4
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 5
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 5
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 6
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 6
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 7
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 7
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 8
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 8
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.05, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 9
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 9
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+### DEGs in cluster 10
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 10
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 11
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 11
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 12
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 12
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 13
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 13
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 14
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 14
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 15
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 15
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+### DEGs in cluster 16
+
+```{r, fig.width=12, fig.height=8}
+rm(genes, overlap_genes, GO.res,  p1, p2)
+cls <- 16
+
+genes <- all_pos_markers %>% filter(cluster == cls) %>% pull(gene) 
+overlap_genes <- intersect(genes, bkg_genes)
+
+GO.res <- enrichGO(overlap_genes, OrgDb = "org.Mm.eg.db", keyType = "SYMBOL", ont = "BP", universe = bkg_genes,
+                   pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable=T)
+
+n.enrich <- GO.res@result %>% filter(p.adjust <=0.05, qvalue <= 0.2) %>% nrow()
+
+if (n.enrich >=5){
+  GO.res <- pairwise_termsim(GO.res, method = "JC")
+  GO.res <- simplify(GO.res, cutoff=0.7, by="p.adjust", select_fun=min)
+  p1 <- treeplot(GO.res, cluster.params=list(n=min(n.enrich, 5)) )
+  print(p1)
+  p2 <- mutate(GO.res, qscore = -log(p.adjust, base=10)) %>% barplot(x="qscore")
+  print(p2)
+  datatable(GO.res@result, extensions="Buttons",
+          options = list(dom="Blfrtip", buttons=c("copy","csv","excel","pdf","print")))
+
+  }
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.h <- enricher(overlap_genes, TERM2GENE = msig.mhallmark, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Hallmarks"
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  dotplot(ER.h, title=pathway.name)
+}
+
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  barplot(ER.h, title = pathway.name)
+}
+if ( !is.null(ER.h) && nrow(ER.h) > 0 ) {
+  datatable(ER.h@result)
+}
+
+```
+
+
+```{r, fig.width=12, fig.height=6}
+ER.cp <- enricher(overlap_genes, TERM2GENE = msig.m2, pvalueCutoff  = 0.01, qvalueCutoff = 0.05, 
+               pAdjustMethod = "BH", minGSSize = 10, maxGSSize = 500, universe = bkg_genes)
+
+pathway.name <- "Canonical pathways"
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  dotplot(ER.cp, title=pathway.name)
+}
+
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  barplot(ER.cp, title = pathway.name)
+}
+if ( !is.null(ER.cp) && nrow(ER.cp) > 0 ) {
+  datatable(ER.cp@result)
+}
+
+```
+
+
+
+
+```{r include=FALSE}
+saveRDS(merge.postnatal, file = "Postnatal_P1P7_integration.rds")
+saveRDS(all_markers, "markers_for_merged_postnatal.rds")
+
+
+# merge.postnatal <- readRDS("Postnatal_P1P7_integration.rds")
+# all_markers <- readRDS("markers_for_merged_postnatal.rds")
+```
+
+
+
+
+
+
