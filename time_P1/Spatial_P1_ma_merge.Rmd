@@ -137,7 +137,7 @@ dittoDimPlot(merge.P1.filtered, var = "seurat_clusters", reduction.use = "umap",
 # ggsave(filename = "Ditto_Umap_clusters_splitbySample.pdf")
 ```
 
-Check whether the order of the barcodes are the same. Replace cell embeddings and seurat clusters from integrated data. 
+Check whether the order of the barcodes is the same. Replace cell embeddings and Seurat clusters from integrated data. 
 
 ```{r}
 all.equal(colnames(merge.P1.filtered), colnames(P1.combind.sct)) # TRUE 
